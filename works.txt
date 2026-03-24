@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+scrape_report.py
+----------------
+Downloads an authenticated report from partners.build.ai (a React SPA) and
+produces a fully self-contained HTML file with all sections (Overview, Worker
+Analysis, Improvement Plan, …), all assets inlined, and all videos downloaded
+locally — accessible by anyone without a login.
+
+Requirements:
+    pip install playwright beautifulsoup4 requests
+    playwright install chromium
+
+Usage:
+    python scrape_report.py
+"""
+
+import asyncio
+import base64
+import hashlib
+import mimetypes
+import os
+import re
+import urllib.parse
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+REPORT_URL = (
+    "https://partners.build.ai/factory-report/"
+    "ddf7d5a5-77f5-514a-affc-b33ed27e44f6?recording_date=2026-03-09"
+)
+
+OUTPUT_DIR  = Path("report_output")
+ASSETS_DIR  = OUTPUT_DIR / "assets"
+VIDEOS_DIR  = OUTPUT_DIR / "videos"
+OUTPUT_HTML = OUTPUT_DIR / "report.html"
+
+INLINE_ASSETS    = True
+INLINE_THRESHOLD = 512 * 1024   # assets smaller than this are base64-inlined
+
+AUTH_STATE = Path("auth_state.json")   # saved after first login
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _slug(url: str) -> str:
+    digest = hashlib.md5(url.encode()).hexdigest()[:8]
+    path   = urllib.parse.urlparse(url).path
+    name   = Path(path).name or "asset"
+    stem, ext = os.path.splitext(name)
+    stem = re.sub(r"[^\w\-]", "_", stem)[:40]
+    return f"{stem}_{digest}{ext}" if ext else f"{stem}_{digest}"
+
+def _mime_to_ext(mime: str) -> str:
+    return mimetypes.guess_extension(mime.split(";")[0].strip()) or ""
+
+def _is_video(url: str, ct: str = "") -> bool:
+    ext = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    return ext in {".mp4", ".webm", ".ogg", ".mov", ".m4v", ".mkv"} or ct.startswith("video/")
+
+def _data_uri(data: bytes, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+# ── Step 1 – Authenticate ─────────────────────────────────────────────────────
+
+async def authenticate() -> None:
+    print("\n🔐  Opening browser for Google login …")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        ctx     = await browser.new_context()
+        page    = await ctx.new_page()
+        await page.goto(REPORT_URL)
+        print("   → Sign in with Google in the browser window.")
+        print("   → Wait until the report is fully visible, THEN press ENTER here.")
+        input("   [ENTER when report is loaded] ")
+        await ctx.storage_state(path=str(AUTH_STATE))
+        print(f"   ✓ Auth saved → {AUTH_STATE}")
+        await browser.close()
+
+# ── Step 2 – Wait helpers ─────────────────────────────────────────────────────
+
+async def _wait_for_content(page) -> None:
+    """Block until real content (video grid / headings) appears."""
+    for sel in ["video", "h1", "[class*='grid']", "[class*='video']",
+                "main", "article", "[class*='report']"]:
+        try:
+            await page.wait_for_selector(sel, timeout=15_000)
+            print(f"      ✓ Content visible ({sel})")
+            return
+        except Exception:
+            continue
+    print("      ⚠  No selector matched — waiting 10 s …")
+    await page.wait_for_timeout(10_000)
+
+async def _scroll(page) -> None:
+    """Slow scroll to trigger lazy-loads."""
+    await page.evaluate("""
+        () => new Promise(resolve => {
+            let y = 0;
+            const step = () => {
+                window.scrollTo(0, y);
+                y += 300;
+                if (y < document.body.scrollHeight) setTimeout(step, 60);
+                else { window.scrollTo(0, 0); setTimeout(resolve, 400); }
+            };
+            step();
+        })
+    """)
+
+async def _grab_content(page) -> str:
+    """Return inner HTML of the main content area."""
+    for sel in ["main", "article", "[class*='content']", "[class*='report']", "#root"]:
+        el = await page.query_selector(sel)
+        if el:
+            html = await el.inner_html()
+            print(f"      ✓ Grabbed via {sel}  ({len(html):,} chars)")
+            return html
+    html = await page.content()
+    print(f"      ⚠  Full page fallback  ({len(html):,} chars)")
+    return html
+
+# ── Step 3 – Fetch all sections ───────────────────────────────────────────────
+
+NAV_SEL = ", ".join([
+    "nav a", "aside a",
+    "[class*='sidebar'] a", "[class*='nav'] a", "[class*='menu'] a",
+])
+
+async def fetch_all_sections() -> tuple[list[tuple[str, str]], str, str]:
+    """
+    Returns:
+        sections   – list of (nav_label, content_inner_html)
+        base_url   – final URL after load
+        shell_html – full page HTML (used to extract <head>)
+    """
+    print("\n📥  Loading report …")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)   # visible = better JS compat
+        ctx     = await browser.new_context(storage_state=str(AUTH_STATE))
+        page    = await ctx.new_page()
+        page.set_default_timeout(90_000)
+
+        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=90_000)
+        await _wait_for_content(page)
+        await page.wait_for_timeout(3_000)
+        base_url = page.url
+        print(f"   ✓ Loaded: {base_url}")
+
+        # ── Discover nav items ──
+        raw_links = await page.query_selector_all(NAV_SEL)
+        seen, nav_labels = set(), []
+        for el in raw_links:
+            try:
+                label = (await el.inner_text()).strip()
+                href  = (await el.get_attribute("href") or "").strip()
+                if label and label not in seen and not href.startswith("http"):
+                    seen.add(label)
+                    nav_labels.append(label)
+            except Exception:
+                continue
+
+        print(f"   ✓ Nav sections found: {nav_labels or ['(none)']}")
+
+        sections: list[tuple[str, str]] = []
+
+        if not nav_labels:
+            # Single-page report
+            await _scroll(page)
+            await page.wait_for_timeout(2_000)
+            sections.append(("Report", await _grab_content(page)))
+        else:
+            for idx, label in enumerate(nav_labels):
+                print(f"\n   [{idx+1}/{len(nav_labels)}] Navigating → {label!r}")
+                all_links = await page.query_selector_all(NAV_SEL)
+                clicked = False
+                for el in all_links:
+                    try:
+                        if (await el.inner_text()).strip() == label:
+                            await el.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        continue
+                if not clicked:
+                    print(f"      ⚠  Could not click — skipping.")
+                    continue
+
+                await page.wait_for_timeout(1_500)
+                await _wait_for_content(page)
+                await _scroll(page)
+                await page.wait_for_timeout(2_000)
+                sections.append((label, await _grab_content(page)))
+
+        shell_html = await page.content()
+        await browser.close()
+
+    return sections, base_url, shell_html
+
+# ── Step 4 – Collect browser cookies ─────────────────────────────────────────
+
+async def get_cookies() -> list[dict]:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx     = await browser.new_context(storage_state=str(AUTH_STATE))
+        cookies = await ctx.cookies()
+        await browser.close()
+    return cookies
+
+# ── Step 5 – Build combined HTML ──────────────────────────────────────────────
+
+def build_html(sections: list[tuple[str, str]], shell_html: str) -> str:
+    """Wrap all sections in a sidebar+content layout."""
+    shell_soup = BeautifulSoup(shell_html, "html.parser")
+    head = shell_soup.find("head") or BeautifulSoup("<head></head>", "html.parser").head
+
+    nav_btns = "\n".join(
+        f'<button class="sec-btn{" active" if i==0 else ""}" onclick="showSec({i})">'
+        f'{lbl}</button>'
+        for i, (lbl, _) in enumerate(sections)
+    )
+    panels = "\n".join(
+        f'<div class="sec-panel" id="sec-{i}" style="display:{"block" if i==0 else "none"}">'
+        f'<h2 class="sec-heading">{lbl}</h2>{content}</div>'
+        for i, (lbl, content) in enumerate(sections)
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+{head}
+<body style="margin:0;font-family:system-ui,sans-serif;background:#fff">
+<div style="display:flex;min-height:100vh">
+
+  <aside style="width:220px;min-width:220px;flex-shrink:0;background:#f9fafb;
+                border-right:1px solid #e5e7eb;padding:2rem 1rem;
+                position:sticky;top:0;height:100vh;overflow-y:auto;box-sizing:border-box">
+    <div style="font-size:.7rem;color:#9ca3af;letter-spacing:.08em;margin-bottom:.4rem">build</div>
+    <div style="font-weight:700;font-size:.95rem;margin-bottom:.2rem">DIVINITEE GENESS</div>
+    <div style="font-size:.78rem;color:#6b7280;margin-bottom:1.8rem">09 Mar 2026</div>
+    <nav style="display:flex;flex-direction:column;gap:2px">
+      {nav_btns}
+    </nav>
+  </aside>
+
+  <main style="flex:1;padding:2.5rem;overflow-x:hidden;min-width:0">
+    {panels}
+  </main>
+
+</div>
+
+<div style="position:fixed;bottom:0;left:0;right:0;background:#111827;color:#d1d5db;
+            font:11px/2 sans-serif;text-align:center;z-index:99999;padding:2px 8px">
+  Offline copy — originally from partners.build.ai
+</div>
+
+<style>
+  .sec-btn {{
+    display:block;width:100%;text-align:left;padding:.45rem .75rem;
+    border:none;background:none;cursor:pointer;border-radius:6px;
+    font-size:.88rem;color:#374151;transition:background .15s;
+  }}
+  .sec-btn:hover {{ background:#e5e7eb; }}
+  .sec-btn.active {{ background:#e5e7eb;font-weight:600; }}
+  .sec-heading {{
+    font-size:1.25rem;margin:0 0 1.25rem;padding-bottom:.6rem;
+    border-bottom:1px solid #e5e7eb;color:#111827;
+  }}
+  video {{ max-width:100%;border-radius:8px; }}
+</style>
+<script>
+  function showSec(idx) {{
+    document.querySelectorAll('.sec-panel').forEach((el,i) => {{
+      el.style.display = i === idx ? 'block' : 'none';
+    }});
+    document.querySelectorAll('.sec-btn').forEach((el,i) => {{
+      el.classList.toggle('active', i === idx);
+    }});
+  }}
+</script>
+</body></html>"""
+
+# ── Step 6 – Download & rewrite assets ───────────────────────────────────────
+
+def process_assets(combined_html: str, base_url: str, cookies: list[dict]) -> str:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+
+    session = requests.Session()
+    for ck in cookies:
+        session.cookies.set(ck["name"], ck["value"], domain=ck.get("domain", ""))
+
+    soup = BeautifulSoup(combined_html, "html.parser")
+
+    def resolve(u: str) -> str:
+        return urllib.parse.urljoin(base_url, u)
+
+    def process_url(raw: str) -> str:
+        if (not raw or raw.startswith("data:") or
+                raw.startswith("#") or raw.startswith("javascript:")):
+            return raw
+        url = resolve(raw)
+        try:
+            r  = session.get(url, timeout=60, stream=True)
+            r.raise_for_status()
+            data = r.content
+            ct   = r.headers.get("content-type", "application/octet-stream")
+        except Exception as e:
+            print(f"   ⚠  {url[:80]} → {e}")
+            return raw
+
+        if _is_video(url, ct):
+            dest = VIDEOS_DIR / _slug(url)
+            if not dest.suffix:
+                dest = dest.with_suffix(_mime_to_ext(ct) or ".mp4")
+            dest.write_bytes(data)
+            rel = dest.relative_to(OUTPUT_DIR).as_posix()
+            print(f"   🎬  {rel}  ({len(data)/1_048_576:.1f} MB)")
+            return rel
+
+        mime = ct.split(";")[0].strip() or "application/octet-stream"
+        if INLINE_ASSETS and len(data) < INLINE_THRESHOLD:
+            return _data_uri(data, mime)
+
+        dest = ASSETS_DIR / _slug(url)
+        if not dest.suffix:
+            dest = dest.with_suffix(_mime_to_ext(ct) or ".bin")
+        dest.write_bytes(data)
+        return dest.relative_to(OUTPUT_DIR).as_posix()
+
+    for tag_name, attr in [
+        ("link",   "href"), ("script", "src"),
+        ("img",    "src"),  ("img",    "data-src"),
+        ("source", "src"),  ("video",  "src"), ("video", "poster"),
+    ]:
+        for tag in soup.find_all(tag_name, **{attr: True}):
+            tag[attr] = process_url(tag[attr])
+
+    for style_tag in soup.find_all("style"):
+        if style_tag.string:
+            style_tag.string = re.sub(
+                r'url\(\s*([^)]+)\s*\)',
+                lambda m: f"url({process_url(m.group(1).strip(chr(39)+chr(34)))})",
+                style_tag.string
+            )
+
+    for img in soup.find_all(srcset=True):
+        parts = []
+        for part in img["srcset"].split(","):
+            tokens = part.strip().split()
+            if tokens:
+                tokens[0] = process_url(tokens[0])
+            parts.append(" ".join(tokens))
+        img["srcset"] = ", ".join(parts)
+
+    for video in soup.find_all("video"):
+        video["controls"] = ""
+        video["playsinline"] = ""
+
+    return str(soup)
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main():
+    if not AUTH_STATE.exists():
+        await authenticate()
+    else:
+        print(f"ℹ️   Using saved auth: {AUTH_STATE}  (delete to re-login)\n")
+
+    sections, base_url, shell_html = await fetch_all_sections()
+
+    if not sections:
+        print("❌  No content captured. Try deleting auth_state.json and re-running.")
+        return
+
+    print(f"\n   Captured {len(sections)} section(s): {[s for s,_ in sections]}")
+
+    cookies = await get_cookies()
+
+    print("\n🔧  Building HTML & downloading assets/videos …")
+    raw_html   = build_html(sections, shell_html)
+    final_html = process_assets(raw_html, base_url, cookies)
+
+    OUTPUT_HTML.write_text(final_html, encoding="utf-8")
+    size_mb = OUTPUT_HTML.stat().st_size / 1_048_576
+    print(f"\n✅  Done!")
+    print(f"   HTML   → {OUTPUT_HTML}  ({size_mb:.1f} MB)")
+    print(f"   Videos → {VIDEOS_DIR}/")
+    print(f"   Assets → {ASSETS_DIR}/")
+    print("\n   To share: zip report_output/ or host on any static file server.")
+    print("   Open report_output/report.html in any browser — no login needed.")
+
+if __name__ == "__main__":
+    asyncio.run(main())

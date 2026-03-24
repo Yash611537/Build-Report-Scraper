@@ -1,0 +1,7 @@
+[build]
+  publish = "report_output"
+
+[[redirects]]
+  from = "/"
+  to = "/report.html"
+  status = 200
